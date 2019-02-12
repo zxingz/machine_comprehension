@@ -5,18 +5,22 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import json
 import math
 import os
 import six
 import tensorflow as tf
-from uuid import uuid4
 import sys
 from ConfigParser import ConfigParser
 from tensorflow.python.estimator.estimator import Estimator
 from tensorflow.python.estimator.run_config import RunConfig
 from tensorflow.python.estimator.model_fn import EstimatorSpec
 from tensorflow.python.eager import context as TFContext
+from tensorflow.python.estimator.estimator import _check_hooks_type as TFCheckHookType
+from tensorflow.python.training import checkpoint_management
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import random_seed
+from tensorflow.python.estimator import model_fn as model_fn_lib
+from tensorflow.python.training import training
 
 appDir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # Declaring Application Directory
 
@@ -737,72 +741,55 @@ def process(questions, context):
     '''
     Estimator Predictor start
     '''
-    from tensorflow.python.eager import context as TFContext
-    from tensorflow.python.estimator.estimator import _check_hooks_type as TFCheckHookType
-    from tensorflow.python.training import checkpoint_management
-    with TFContext.graph_mode():
-      hooks = TFCheckHookType(None)
-      # Check that model has been trained.
-      checkpoint_path = checkpoint_management.latest_checkpoint(
-            estimator._model_dir)
-      if not checkpoint_path:
+    hooks = TFCheckHookType(None)
+    # Check that model has been trained.
+    checkpoint_path = checkpoint_management.latest_checkpoint(
+        estimator._model_dir)
+    if not checkpoint_path:
         tf.logging.error('Could not find trained model in model_dir: {}, running '
-                     'initialization to predict.'.format(estimator._model_dir))
-      with ops.Graph().as_default() as g:
-        random_seed.set_random_seed(self._config.tf_random_seed)
-        self._create_and_assert_global_step(g)
-        features, input_hooks = self._get_features_from_input_fn(
-            input_fn, model_fn_lib.ModeKeys.PREDICT)
-        estimator_spec = self._call_model_fn(
-            features, None, model_fn_lib.ModeKeys.PREDICT, self.config)
+                         'initialization to predict.'.format(estimator._model_dir))
+    random_seed.set_random_seed(estimator._config.tf_random_seed)
+    features, input_hooks = estimator._get_features_from_input_fn(
+        predict_input_fn, model_fn_lib.ModeKeys.PREDICT)
+    estimator_spec = estimator._call_model_fn(
+        features, None, model_fn_lib.ModeKeys.PREDICT, estimator.config)
 
-        # Call to warm_start has to be after model_fn is called.
-        self._maybe_warm_start(checkpoint_path)
-
-        predictions = self._extract_keys(
-            estimator_spec.predictions, predict_keys)
-        all_hooks = list(input_hooks)
-        all_hooks.extend(hooks)
-        all_hooks.extend(list(estimator_spec.prediction_hooks or []))
-        with training.MonitoredSession(
+    predictions = estimator._extract_keys(
+        estimator_spec.predictions, None)
+    all_hooks = list(input_hooks)
+    all_hooks.extend(hooks)
+    all_hooks.extend(list(estimator_spec.prediction_hooks or []))
+    with training.MonitoredSession(
             session_creator=training.ChiefSessionCreator(
                 checkpoint_filename_with_path=checkpoint_path,
-                master=self._config.master,
+                master=estimator._config.master,
                 scaffold=estimator_spec.scaffold,
-                config=self._session_config),
+                config=estimator._session_config),
             hooks=all_hooks) as mon_sess:
-          while not mon_sess.should_stop():
+        while not mon_sess.should_stop():
             preds_evaluated = mon_sess.run(predictions)
-            if not yield_single_examples:
-              yield preds_evaluated
-            elif not isinstance(predictions, dict):
-              for pred in preds_evaluated:
-                yield pred
-            else:
-              for i in range(self._extract_batch_length(preds_evaluated)):
-                yield {
+            for i in range(estimator._extract_batch_length(preds_evaluated)):
+                result = {
                     key: value[i]
                     for key, value in six.iteritems(preds_evaluated)
                 }
+                unique_id = int(result["unique_ids"])
+                start_logits = [float(x) for x in result["start_logits"].flat]
+                end_logits = [float(x) for x in result["end_logits"].flat]
+                all_predictions, all_nbest_json = compute_predictions(
+                    eval_examples[eval_features[unique_id].example_index],
+                    [eval_features[unique_id]],
+                    RawResult(
+                        unique_id=unique_id,
+                        start_logits=start_logits,
+                        end_logits=end_logits),
+                    10, 128, True)
+                print('--------------------------------')
+                print(all_nbest_json)
     '''
     Estimator predictor end
     '''
-
-    for result in estimator.predict(predict_input_fn, yield_single_examples=True):
-        unique_id = int(result["unique_ids"])
-        start_logits = [float(x) for x in result["start_logits"].flat]
-        end_logits = [float(x) for x in result["end_logits"].flat]
-        all_predictions, all_nbest_json = compute_predictions(
-            eval_examples[eval_features[unique_id].example_index],
-            [eval_features[unique_id]],
-            RawResult(
-                unique_id=unique_id,
-                start_logits=start_logits,
-                end_logits=end_logits),
-            10, 128, True)
-        print('--------------------------------')
-        print(all_nbest_json)
-    return all_nbest_json
+    return []
 
 
 if __name__ == "__main__":
