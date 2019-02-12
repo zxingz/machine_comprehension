@@ -1,0 +1,861 @@
+# coding=utf-8
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import collections
+import json
+import math
+import os
+import six
+import tensorflow as tf
+from uuid import uuid4
+import sys
+from ConfigParser import ConfigParser
+from tensorflow.python.estimator.estimator import Estimator
+from tensorflow.python.estimator.run_config import RunConfig
+from tensorflow.python.estimator.model_fn import EstimatorSpec
+from tensorflow.python.eager import context as TFContext
+
+appDir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # Declaring Application Directory
+
+sys.path.append(appDir)  # Adding code directory path for standalone execution
+config = ConfigParser()
+config.read(os.path.join(appDir, 'config.cfg'))
+modelDir = os.path.realpath(config.get('BERT', 'dest_model_dir'))
+if __name__ == '__main__':
+    modelDir = os.path.join(appDir, 'model')
+
+from BERT import modeling
+from BERT import optimization
+from BERT import tokenization
+
+RawResult = collections.namedtuple("RawResult",
+                                   ["unique_id", "start_logits", "end_logits"])
+
+
+class SquadExample(object):
+    """A single training/test example for simple sequence classification.
+       For examples without an answer, the start and end position are -1.
+    """
+
+    def __init__(self,
+                 qas_id,
+                 question_text,
+                 doc_tokens,
+                 orig_answer_text=None,
+                 start_position=None,
+                 end_position=None,
+                 is_impossible=False):
+        self.qas_id = qas_id
+        self.question_text = question_text
+        self.doc_tokens = doc_tokens
+        self.orig_answer_text = orig_answer_text
+        self.start_position = start_position
+        self.end_position = end_position
+        self.is_impossible = is_impossible
+
+    def __str__(self):
+        return self.__repr__()
+
+    def __repr__(self):
+        s = ""
+        s += "qas_id: %s" % (tokenization.printable_text(self.qas_id))
+        s += ", question_text: %s" % (
+            tokenization.printable_text(self.question_text))
+        s += ", doc_tokens: [%s]" % (" ".join(self.doc_tokens))
+        if self.start_position:
+            s += ", start_position: %d" % (self.start_position)
+        if self.start_position:
+            s += ", end_position: %d" % (self.end_position)
+        if self.start_position:
+            s += ", is_impossible: %r" % (self.is_impossible)
+        return s
+
+
+class InputFeatures(object):
+    """A single set of features of data."""
+
+    def __init__(self,
+                 unique_id,
+                 example_index,
+                 doc_span_index,
+                 tokens,
+                 token_to_orig_map,
+                 token_is_max_context,
+                 input_ids,
+                 input_mask,
+                 segment_ids,
+                 start_position=None,
+                 end_position=None,
+                 is_impossible=None):
+        self.unique_id = unique_id
+        self.example_index = example_index
+        self.doc_span_index = doc_span_index
+        self.tokens = tokens
+        self.token_to_orig_map = token_to_orig_map
+        self.token_is_max_context = token_is_max_context
+        self.input_ids = input_ids
+        self.input_mask = input_mask
+        self.segment_ids = segment_ids
+        self.start_position = start_position
+        self.end_position = end_position
+        self.is_impossible = is_impossible
+
+
+def read_QA(qa, paragraphs):
+    def is_whitespace(c):
+        if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
+            return True
+        return False
+
+    examples = []
+
+    for paragraph in paragraphs:
+        paragraph_text = paragraph['text']
+        doc_tokens = []
+        char_to_word_offset = []
+        prev_is_whitespace = True
+        for c in paragraph_text:
+            if is_whitespace(c):
+                prev_is_whitespace = True
+            else:
+                if prev_is_whitespace:
+                    doc_tokens.append(c)
+                else:
+                    doc_tokens[-1] += c
+                prev_is_whitespace = False
+            char_to_word_offset.append(len(doc_tokens) - 1)
+
+        qas_id = paragraph["id"]
+        question_text = qa
+        start_position = None
+        end_position = None
+        orig_answer_text = None
+        is_impossible = False
+
+        example = SquadExample(
+            qas_id=qas_id,
+            question_text=question_text,
+            doc_tokens=doc_tokens,
+            orig_answer_text=orig_answer_text,
+            start_position=start_position,
+            end_position=end_position,
+            is_impossible=is_impossible)
+        examples.append(example)
+    return examples
+
+
+def input_fn_builder(features, seq_length, drop_remainder):
+    """Creates an `input_fn` closure to be passed to TPUEstimator."""
+
+    all_unique_ids = []
+    all_input_ids = []
+    all_input_mask = []
+    all_segment_ids = []
+    all_start_positions = []
+    all_end_positions = []
+
+    for feature in features:
+        all_unique_ids.append(feature.unique_id)
+        all_input_ids.append(feature.input_ids)
+        all_input_mask.append(feature.input_mask)
+        all_segment_ids.append(feature.segment_ids)
+        all_start_positions.append(feature.start_position)
+        all_end_positions.append(feature.end_position)
+
+    def input_fn(params):
+        """The actual input function."""
+        batch_size = params["batch_size"]
+
+        tf.logging.info('Inside input_fn')
+
+        num_examples = len(features)
+
+        # This is for demo purposes and does NOT scale to large data sets. We do
+        # not use Dataset.from_generator() because that uses tf.py_func which is
+        # not TPU compatible. The right way to load data is with TFRecordReader.
+        feature_map = {
+            "unique_ids":
+                tf.constant(all_unique_ids, shape=[num_examples], dtype=tf.int32),
+            "input_ids":
+                tf.constant(
+                    all_input_ids, shape=[num_examples, seq_length],
+                    dtype=tf.int32),
+            "input_mask":
+                tf.constant(
+                    all_input_mask,
+                    shape=[num_examples, seq_length],
+                    dtype=tf.int32),
+            "segment_ids":
+                tf.constant(
+                    all_segment_ids,
+                    shape=[num_examples, seq_length],
+                    dtype=tf.int32),
+        }
+
+        d = tf.data.Dataset.from_tensor_slices(feature_map)
+        d = d.repeat()
+        d = d.batch(batch_size=batch_size, drop_remainder=drop_remainder)
+        return d
+
+    return input_fn
+
+
+def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
+                 use_one_hot_embeddings):
+    """Creates a classification model."""
+    model = modeling.BertModel(
+        config=bert_config,
+        is_training=is_training,
+        input_ids=input_ids,
+        input_mask=input_mask,
+        token_type_ids=segment_ids,
+        use_one_hot_embeddings=use_one_hot_embeddings)
+
+    final_hidden = model.get_sequence_output()
+
+    final_hidden_shape = modeling.get_shape_list(final_hidden, expected_rank=3)
+    batch_size = final_hidden_shape[0]
+    seq_length = final_hidden_shape[1]
+    hidden_size = final_hidden_shape[2]
+
+    output_weights = tf.get_variable(
+        "cls/squad/output_weights", [2, hidden_size],
+        initializer=tf.truncated_normal_initializer(stddev=0.02))
+
+    output_bias = tf.get_variable(
+        "cls/squad/output_bias", [2], initializer=tf.zeros_initializer())
+
+    final_hidden_matrix = tf.reshape(final_hidden,
+                                     [batch_size * seq_length, hidden_size])
+    logits = tf.matmul(final_hidden_matrix, output_weights, transpose_b=True)
+    logits = tf.nn.bias_add(logits, output_bias)
+
+    logits = tf.reshape(logits, [batch_size, seq_length, 2])
+    logits = tf.transpose(logits, [2, 0, 1])
+
+    unstacked_logits = tf.unstack(logits, axis=0)
+
+    (start_logits, end_logits) = (unstacked_logits[0], unstacked_logits[1])
+
+    return (start_logits, end_logits)
+
+
+def model_fn_builder(bert_config, init_checkpoint, use_one_hot_embeddings):
+    """Returns `model_fn` closure for TPUEstimator."""
+
+    def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
+        """The `model_fn` for TPUEstimator."""
+
+        tf.logging.info("*** Features ***")
+        for name in sorted(features.keys()):
+            tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+
+        unique_ids = features["unique_ids"]
+        input_ids = features["input_ids"]
+        input_mask = features["input_mask"]
+        segment_ids = features["segment_ids"]
+
+        is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+
+        (start_logits, end_logits) = create_model(
+            bert_config=bert_config,
+            is_training=is_training,
+            input_ids=input_ids,
+            input_mask=input_mask,
+            segment_ids=segment_ids,
+            use_one_hot_embeddings=use_one_hot_embeddings)
+
+        tvars = tf.trainable_variables()
+
+        initialized_variable_names = {}
+        scaffold_fn = None
+        if init_checkpoint:
+            (assignment_map, initialized_variable_names
+             ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+            tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+
+        tf.logging.info("**** Trainable Variables ****")
+        for var in tvars:
+            init_string = ""
+            if var.name in initialized_variable_names:
+                init_string = ", *INIT_FROM_CKPT*"
+            tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
+                            init_string)
+
+        predictions = {
+            "unique_ids": unique_ids,
+            "start_logits": start_logits,
+            "end_logits": end_logits,
+        }
+        output_spec = EstimatorSpec(mode=mode, predictions=predictions, scaffold=scaffold_fn)
+        return output_spec
+
+    return model_fn
+
+
+def _check_is_max_context(doc_spans, cur_span_index, position):
+    """Check if this is the 'max context' doc span for the token."""
+
+    # Because of the sliding window approach taken to scoring documents, a single
+    # token can appear in multiple documents. E.g.
+    #  Doc: the man went to the store and bought a gallon of milk
+    #  Span A: the man went to the
+    #  Span B: to the store and bought
+    #  Span C: and bought a gallon of
+    #  ...
+    #
+    # Now the word 'bought' will have two scores from spans B and C. We only
+    # want to consider the score with "maximum context", which we define as
+    # the *minimum* of its left and right context (the *sum* of left and
+    # right context will always be the same, of course).
+    #
+    # In the example the maximum context for 'bought' would be span C since
+    # it has 1 left context and 3 right context, while span B has 4 left context
+    # and 0 right context.
+    best_score = None
+    best_span_index = None
+    for (span_index, doc_span) in enumerate(doc_spans):
+        end = doc_span.start + doc_span.length - 1
+        if position < doc_span.start:
+            continue
+        if position > end:
+            continue
+        num_left_context = position - doc_span.start
+        num_right_context = end - position
+        score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
+        if best_score is None or score > best_score:
+            best_score = score
+            best_span_index = span_index
+
+    return cur_span_index == best_span_index
+
+
+def convert_examples_to_features(examples, tokenizer, max_seq_length,
+                                 doc_stride, max_query_length):
+    """Loads a data file into a list of `InputBatch`s."""
+
+    unique_id = 1000000000
+
+    features = dict()
+
+    for (example_index, example) in enumerate(examples):
+        query_tokens = tokenizer.tokenize(example.question_text)
+
+        if len(query_tokens) > max_query_length:
+            query_tokens = query_tokens[0:max_query_length]
+
+        tok_to_orig_index = []
+        orig_to_tok_index = []
+        all_doc_tokens = []
+        for (i, token) in enumerate(example.doc_tokens):
+            orig_to_tok_index.append(len(all_doc_tokens))
+            sub_tokens = tokenizer.tokenize(token)
+            for sub_token in sub_tokens:
+                tok_to_orig_index.append(i)
+                all_doc_tokens.append(sub_token)
+
+        # The -3 accounts for [CLS], [SEP] and [SEP]
+        max_tokens_for_doc = max_seq_length - len(query_tokens) - 3
+
+        # We can have documents that are longer than the maximum sequence length.
+        # To deal with this we do a sliding window approach, where we take chunks
+        # of the up to our max length with a stride of `doc_stride`.
+        _DocSpan = collections.namedtuple(  # pylint: disable=invalid-name
+            "DocSpan", ["start", "length"])
+        doc_spans = []
+        start_offset = 0
+        while start_offset < len(all_doc_tokens):
+            length = len(all_doc_tokens) - start_offset
+            if length > max_tokens_for_doc:
+                length = max_tokens_for_doc
+            doc_spans.append(_DocSpan(start=start_offset, length=length))
+            if start_offset + length == len(all_doc_tokens):
+                break
+            start_offset += min(length, doc_stride)
+
+        for (doc_span_index, doc_span) in enumerate(doc_spans):
+            tokens = []
+            token_to_orig_map = {}
+            token_is_max_context = {}
+            segment_ids = []
+            tokens.append("[CLS]")
+            segment_ids.append(0)
+            for token in query_tokens:
+                tokens.append(token)
+                segment_ids.append(0)
+            tokens.append("[SEP]")
+            segment_ids.append(0)
+
+            for i in range(doc_span.length):
+                split_token_index = doc_span.start + i
+                token_to_orig_map[len(tokens)] = tok_to_orig_index[split_token_index]
+
+                is_max_context = _check_is_max_context(doc_spans, doc_span_index,
+                                                       split_token_index)
+                token_is_max_context[len(tokens)] = is_max_context
+                tokens.append(all_doc_tokens[split_token_index])
+                segment_ids.append(1)
+            tokens.append("[SEP]")
+            segment_ids.append(1)
+
+            input_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+            # The mask has 1 for real tokens and 0 for padding tokens. Only real
+            # tokens are attended to.
+            input_mask = [1] * len(input_ids)
+
+            # Zero-pad up to the sequence length.
+            while len(input_ids) < max_seq_length:
+                input_ids.append(0)
+                input_mask.append(0)
+                segment_ids.append(0)
+
+            assert len(input_ids) == max_seq_length
+            assert len(input_mask) == max_seq_length
+            assert len(segment_ids) == max_seq_length
+
+            tf.logging.info("*** Example ***")
+            tf.logging.info("unique_id: %s" % (unique_id))
+            tf.logging.info("example_index: %s" % (example_index))
+            tf.logging.info("doc_span_index: %s" % (doc_span_index))
+            tf.logging.info("tokens: %s" % " ".join(
+                [tokenization.printable_text(x) for x in tokens]))
+            tf.logging.info("token_to_orig_map: %s" % " ".join(
+                ["%d:%d" % (x, y) for (x, y) in six.iteritems(token_to_orig_map)]))
+            tf.logging.info("token_is_max_context: %s" % " ".join([
+                "%d:%s" % (x, y) for (x, y) in six.iteritems(token_is_max_context)
+            ]))
+            tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+            tf.logging.info(
+                "input_mask: %s" % " ".join([str(x) for x in input_mask]))
+            tf.logging.info(
+                "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+
+            start_position = None
+            end_position = None
+            feature = InputFeatures(
+                unique_id=unique_id,
+                example_index=example_index,
+                doc_span_index=doc_span_index,
+                tokens=tokens,
+                token_to_orig_map=token_to_orig_map,
+                token_is_max_context=token_is_max_context,
+                input_ids=input_ids,
+                input_mask=input_mask,
+                segment_ids=segment_ids,
+                start_position=start_position,
+                end_position=end_position,
+                is_impossible=example.is_impossible)
+
+            features[unique_id] = feature
+            unique_id += 1
+
+    return features
+
+
+def get_final_text(pred_text, orig_text, do_lower_case):
+    """Project the tokenized prediction back to the original text."""
+
+    # When we created the data, we kept track of the alignment between original
+    # (whitespace tokenized) tokens and our WordPiece tokenized tokens. So
+    # now `orig_text` contains the span of our original text corresponding to the
+    # span that we predicted.
+    #
+    # However, `orig_text` may contain extra characters that we don't want in
+    # our prediction.
+    #
+    # For example, let's say:
+    #   pred_text = steve smith
+    #   orig_text = Steve Smith's
+    #
+    # We don't want to return `orig_text` because it contains the extra "'s".
+    #
+    # We don't want to return `pred_text` because it's already been normalized
+    # (the SQuAD eval script also does punctuation stripping/lower casing but
+    # our tokenizer does additional normalization like stripping accent
+    # characters).
+    #
+    # What we really want to return is "Steve Smith".
+    #
+    # Therefore, we have to apply a semi-complicated alignment heruistic between
+    # `pred_text` and `orig_text` to get a character-to-charcter alignment. This
+    # can fail in certain cases in which case we just return `orig_text`.
+
+    def _strip_spaces(text):
+        ns_chars = []
+        ns_to_s_map = collections.OrderedDict()
+        for (i, c) in enumerate(text):
+            if c == " ":
+                continue
+            ns_to_s_map[len(ns_chars)] = i
+            ns_chars.append(c)
+        ns_text = "".join(ns_chars)
+        return (ns_text, ns_to_s_map)
+
+    # We first tokenize `orig_text`, strip whitespace from the result
+    # and `pred_text`, and check if they are the same length. If they are
+    # NOT the same length, the heuristic has failed. If they are the same
+    # length, we assume the characters are one-to-one aligned.
+    tokenizer = tokenization.BasicTokenizer(do_lower_case=do_lower_case)
+
+    tok_text = " ".join(tokenizer.tokenize(orig_text))
+
+    start_position = tok_text.find(pred_text)
+    if start_position == -1:
+        if True:
+            tf.logging.info(
+                "Unable to find text: '%s' in '%s'" % (pred_text, orig_text))
+        return orig_text
+    end_position = start_position + len(pred_text) - 1
+
+    (orig_ns_text, orig_ns_to_s_map) = _strip_spaces(orig_text)
+    (tok_ns_text, tok_ns_to_s_map) = _strip_spaces(tok_text)
+
+    if len(orig_ns_text) != len(tok_ns_text):
+        if True:
+            tf.logging.info("Length not equal after stripping spaces: '%s' vs '%s'",
+                            orig_ns_text, tok_ns_text)
+        return orig_text
+
+    # We then project the characters in `pred_text` back to `orig_text` using
+    # the character-to-character alignment.
+    tok_s_to_ns_map = {}
+    for (i, tok_index) in six.iteritems(tok_ns_to_s_map):
+        tok_s_to_ns_map[tok_index] = i
+
+    orig_start_position = None
+    if start_position in tok_s_to_ns_map:
+        ns_start_position = tok_s_to_ns_map[start_position]
+        if ns_start_position in orig_ns_to_s_map:
+            orig_start_position = orig_ns_to_s_map[ns_start_position]
+
+    if orig_start_position is None:
+        if True:
+            tf.logging.info("Couldn't map start position")
+        return orig_text
+
+    orig_end_position = None
+    if end_position in tok_s_to_ns_map:
+        ns_end_position = tok_s_to_ns_map[end_position]
+        if ns_end_position in orig_ns_to_s_map:
+            orig_end_position = orig_ns_to_s_map[ns_end_position]
+
+    if orig_end_position is None:
+        if True:
+            tf.logging.info("Couldn't map end position")
+        return orig_text
+
+    output_text = orig_text[orig_start_position:(orig_end_position + 1)]
+    return output_text
+
+
+def _get_best_indexes(logits, n_best_size):
+    """Get the n-best logits from a list."""
+    index_and_score = sorted(enumerate(logits), key=lambda x: x[1], reverse=True)
+
+    best_indexes = []
+    for i in range(len(index_and_score)):
+        if i >= n_best_size:
+            break
+        best_indexes.append(index_and_score[i][0])
+    return best_indexes
+
+
+def _compute_softmax(scores):
+    """Compute softmax probability over raw logits."""
+    if not scores:
+        return []
+
+    max_score = None
+    for score in scores:
+        if max_score is None or score > max_score:
+            max_score = score
+
+    exp_scores = []
+    total_sum = 0.0
+    for score in scores:
+        x = math.exp(score - max_score)
+        exp_scores.append(x)
+        total_sum += x
+
+    probs = []
+    for score in exp_scores:
+        probs.append(score / total_sum)
+    return probs
+
+
+def compute_predictions(example, features, all_results, n_best_size,
+                        max_answer_length, do_lower_case):
+    """Compute final predictions."""
+    unique_id_to_result = dict()
+    unique_id_to_result[all_results.unique_id] = all_results
+
+    _PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+        "PrelimPrediction",
+        ["feature_index", "start_index", "end_index", "start_logit", "end_logit"])
+
+    all_predictions = collections.OrderedDict()
+    all_nbest_json = collections.OrderedDict()
+
+    prelim_predictions = []
+    for (feature_index, feature) in enumerate(features):
+        result = unique_id_to_result[feature.unique_id]
+
+        start_indexes = _get_best_indexes(result.start_logits, n_best_size)
+        end_indexes = _get_best_indexes(result.end_logits, n_best_size)
+        for start_index in start_indexes:
+            for end_index in end_indexes:
+                # We could hypothetically create invalid predictions, e.g., predict
+                # that the start of the span is in the question. We throw out all
+                # invalid predictions.
+                if start_index >= len(feature.tokens):
+                    continue
+                if end_index >= len(feature.tokens):
+                    continue
+                if start_index not in feature.token_to_orig_map:
+                    continue
+                if end_index not in feature.token_to_orig_map:
+                    continue
+                if not feature.token_is_max_context.get(start_index, False):
+                    continue
+                if end_index < start_index:
+                    continue
+                length = end_index - start_index + 1
+                if length > max_answer_length:
+                    continue
+                prelim_predictions.append(
+                    _PrelimPrediction(
+                        feature_index=feature_index,
+                        start_index=start_index,
+                        end_index=end_index,
+                        start_logit=result.start_logits[start_index],
+                        end_logit=result.end_logits[end_index]))
+
+    prelim_predictions = sorted(
+        prelim_predictions,
+        key=lambda x: (x.start_logit + x.end_logit),
+        reverse=True)
+
+    _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
+        "NbestPrediction", ["text", "start_logit", "end_logit"])
+
+    seen_predictions = {}
+    nbest = []
+    for pred in prelim_predictions:
+        if len(nbest) >= n_best_size:
+            break
+        feature = features[pred.feature_index]
+
+        tok_tokens = feature.tokens[pred.start_index:(pred.end_index + 1)]
+        orig_doc_start = feature.token_to_orig_map[pred.start_index]
+        orig_doc_end = feature.token_to_orig_map[pred.end_index]
+        orig_tokens = example.doc_tokens[orig_doc_start:(orig_doc_end + 1)]
+        tok_text = " ".join(tok_tokens)
+
+        # De-tokenize WordPieces that have been split off.
+        tok_text = tok_text.replace(" ##", "")
+        tok_text = tok_text.replace("##", "")
+
+        # Clean whitespace
+        tok_text = tok_text.strip()
+        tok_text = " ".join(tok_text.split())
+        orig_text = " ".join(orig_tokens)
+
+        final_text = get_final_text(tok_text, orig_text, do_lower_case)
+        if final_text in seen_predictions:
+            continue
+
+        seen_predictions[final_text] = True
+        nbest.append(
+            _NbestPrediction(
+                text=final_text,
+                start_logit=pred.start_logit,
+                end_logit=pred.end_logit))
+
+    # In very rare edge cases we could have no valid predictions. So we
+    # just create a nonce prediction in this case to avoid failure.
+    if not nbest:
+        nbest.append(
+            _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
+
+    assert len(nbest) >= 1
+
+    total_scores = []
+    for entry in nbest:
+        total_scores.append(entry.start_logit + entry.end_logit)
+
+    probs = _compute_softmax(total_scores)
+
+    nbest_json = []
+    for (i, entry) in enumerate(nbest):
+        output = collections.OrderedDict()
+        output["text"] = entry.text
+        output["probability"] = probs[i]
+        output["start_logit"] = entry.start_logit
+        output["end_logit"] = entry.end_logit
+        nbest_json.append(output)
+
+    assert len(nbest_json) >= 1
+
+    all_predictions[example.qas_id] = nbest_json[0]["text"]
+    all_nbest_json[example.qas_id] = nbest_json
+
+    return all_predictions, all_nbest_json
+
+
+def process(questions, context):
+    # TODO Replace all abbreviation code
+
+    bert_config = modeling.BertConfig.from_json_file(os.path.join(modelDir, 'bert_config.json'))  # Loading bert config
+    tokenizer = tokenization.FullTokenizer(vocab_file=os.path.join(modelDir, 'vocab.txt'),
+                                           do_lower_case=True)  # Loading tokenizer
+
+    eval_examples = read_QA(questions, context)
+    eval_features = convert_examples_to_features(
+        examples=eval_examples,
+        tokenizer=tokenizer,
+        max_seq_length=512,
+        doc_stride=256,
+        max_query_length=128)
+
+    model_fn = model_fn_builder(
+        bert_config=bert_config,
+        init_checkpoint=os.path.join(modelDir, 'bert_model.ckpt'),
+        use_one_hot_embeddings=False)
+
+    run_config = RunConfig(model_dir=modelDir, save_checkpoints_steps=1000)
+    estimator = Estimator(model_fn=model_fn, config=run_config, params={'batch_size': 14})
+
+    predict_input_fn = input_fn_builder(
+        features=eval_features.values(),
+        seq_length=512,
+        drop_remainder=True)
+
+    '''
+    Estimator Predictor start
+    '''
+    from tensorflow.python.eager import context as TFContext
+    from tensorflow.python.estimator.estimator import _check_hooks_type as TFCheckHookType
+    from tensorflow.python.training import checkpoint_management
+    with TFContext.graph_mode():
+      hooks = TFCheckHookType(None)
+      # Check that model has been trained.
+      checkpoint_path = checkpoint_management.latest_checkpoint(
+            estimator._model_dir)
+      if not checkpoint_path:
+        tf.logging.error('Could not find trained model in model_dir: {}, running '
+                     'initialization to predict.'.format(estimator._model_dir))
+      with ops.Graph().as_default() as g:
+        random_seed.set_random_seed(self._config.tf_random_seed)
+        self._create_and_assert_global_step(g)
+        features, input_hooks = self._get_features_from_input_fn(
+            input_fn, model_fn_lib.ModeKeys.PREDICT)
+        estimator_spec = self._call_model_fn(
+            features, None, model_fn_lib.ModeKeys.PREDICT, self.config)
+
+        # Call to warm_start has to be after model_fn is called.
+        self._maybe_warm_start(checkpoint_path)
+
+        predictions = self._extract_keys(
+            estimator_spec.predictions, predict_keys)
+        all_hooks = list(input_hooks)
+        all_hooks.extend(hooks)
+        all_hooks.extend(list(estimator_spec.prediction_hooks or []))
+        with training.MonitoredSession(
+            session_creator=training.ChiefSessionCreator(
+                checkpoint_filename_with_path=checkpoint_path,
+                master=self._config.master,
+                scaffold=estimator_spec.scaffold,
+                config=self._session_config),
+            hooks=all_hooks) as mon_sess:
+          while not mon_sess.should_stop():
+            preds_evaluated = mon_sess.run(predictions)
+            if not yield_single_examples:
+              yield preds_evaluated
+            elif not isinstance(predictions, dict):
+              for pred in preds_evaluated:
+                yield pred
+            else:
+              for i in range(self._extract_batch_length(preds_evaluated)):
+                yield {
+                    key: value[i]
+                    for key, value in six.iteritems(preds_evaluated)
+                }
+    '''
+    Estimator predictor end
+    '''
+
+    for result in estimator.predict(predict_input_fn, yield_single_examples=True):
+        unique_id = int(result["unique_ids"])
+        start_logits = [float(x) for x in result["start_logits"].flat]
+        end_logits = [float(x) for x in result["end_logits"].flat]
+        all_predictions, all_nbest_json = compute_predictions(
+            eval_examples[eval_features[unique_id].example_index],
+            [eval_features[unique_id]],
+            RawResult(
+                unique_id=unique_id,
+                start_logits=start_logits,
+                end_logits=end_logits),
+            10, 128, True)
+        print('--------------------------------')
+        print(all_nbest_json)
+    return all_nbest_json
+
+
+if __name__ == "__main__":
+    tf.logging.set_verbosity(tf.logging.INFO)
+    bertQuestion = 'who is chief operating officer of enercare ?'
+
+    bertContext = [{"id": 1,
+                    "text": '''Enercare Announces Retirement of President
+and Chief Executive Officer and Appointment
+of Jenine Krause
+TORONTO, Aug. 15, 2018 /CNW/ - Enercare Inc. (TSX: ECI) and Enercare Solutions Inc.
+(collectively, "Enercare") announced that John Macdonald, Enercare's President and Chief Executive
+Officer, will retire from his role today. Upon his retirement, Jenine Krause, Chief Operating Officer,
+Home Services has been appointed President and Chief Executive Officer of Enercare. Mr.
+Macdonald will remain with Enercare in an advisory capacity until the end of the year to ensure a
+smooth transition.
+"On behalf of the Board, I would like to thank John for his tremendous contributions to Enercare
+throughout his twelve years. John has done an exceptional job leading Enercare. Under his
+leadership, the company has grown to become one of North America's premier providers of home
+and commercial services. It was this growth and success that has led to the recent announcement
+that Enercare had entered into an agreement to be acquired by Brookfield Infrastructure for $4.3
+billion," said Mr. Pantelidis, Chair of the Board.
+"We are very pleased to announce the appointment of Jenine Krause to the role of President and
+Chief Executive Officer. Jenine joined Enercare in February 2016 as the Chief Operating Officer to
+lead our Enercare Home Services business unit, which has shown consistent revenue and EBITDA
+growth during her tenure. As a key member of the management team, Jenine has been instrumental
+in developing our strategic growth plan that focuses on leveraging technology to enhance the
+customer experience. Prior to Enercare, Jenine held a number of senior executive positions and has
+a consistently successful track record in strategic planning, operations management and leading
+large organizational change," said Mr. Pantelidis.
+"Looking ahead, I'm very excited about the opportunities for growth in the Enercare businesses,
+which will continue to position us as the service provider of choice in North America. I am delighted
+to have the opportunity to lead the company through this exciting next phase of our growth," said Ms.
+Krause.
+About Enercare Inc.
+Enercare is headquartered in Markham, Ontario, Canada and is publicly traded on the Toronto Stock
+Exchange (TSX: ECI). As one of North America's largest home and commercial services and energy
+solutions companies with approximately 5,100 employees under its Enercare and Service Experts
+brands, Enercare is a leading provider of water heaters, water treatment, furnaces, air conditioners
+and other HVAC rental products, plumbing services, protection plans and related services. With
+operations in Canada and the United States, Enercare serves approximately 1.6 million customers
+annually. Enercare is also the largest non-utility sub-meter provider, with electricity, water, thermal
+and gas metering contracts for condominium and apartment suites in Canada and through its Triacta
+Power Technologies Inc. brand, a premier designer and manufacturer of advanced sub-meters and
+sub-metering solutions.
+For more information on Enercare visit enercare.ca. Additional information regarding Enercare is
+available through our investor relations website at corporate.enercare.ca or on SEDAR at
+www.sedar.com. Subscribe to our email alerts at corporate.enercare.ca/email-alerts to receive our
+news releases electronically.
+SOURCE Enercare Inc.'''},
+                   {"id": 3,
+                    "text": '''Upon his retirement, Benjamin Franklin, Chief Operating Officer, Home Services has been
+    appointed President and Chief Executive Officer of Enercare.'''},
+                   ]
+
+    print(process(questions=bertQuestion, context=bertContext))
