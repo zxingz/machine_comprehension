@@ -5,33 +5,31 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import json
 import math
 import os
 import six
 import tensorflow as tf
-from uuid import uuid4
 import sys
 from ConfigParser import ConfigParser
 from tensorflow.python.estimator.estimator import Estimator
 from tensorflow.python.estimator.run_config import RunConfig
 from tensorflow.python.estimator.model_fn import EstimatorSpec
+import unicodedata
 
 appDir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))  # Declaring Application Directory
 
 sys.path.append(appDir)  # Adding code directory path for standalone execution
-config = ConfigParser()
-config.read(os.path.join(appDir, 'config.cfg'))
-modelDir = os.path.realpath(config.get('BERT', 'dest_model_dir'))
-if __name__ == '__main__':
-    modelDir = os.path.join(appDir, 'model')
 
+# Import bert models
 from BERT import modeling
-from BERT import optimization
 from BERT import tokenization
 
-RawResult = collections.namedtuple("RawResult",
-                                   ["unique_id", "start_logits", "end_logits"])
+config = ConfigParser()  # Init config parser
+config.read(os.path.join(appDir, 'config.cfg'))  # Read config file
+modelDir = os.path.realpath(config.get('BERT', 'dest_model_dir'))  # Init model dir
+
+if __name__ == '__main__':  # for standalone calls
+    modelDir = os.path.join(appDir, 'model')
 
 
 class SquadExample(object):
@@ -104,30 +102,16 @@ class InputFeatures(object):
 
 
 def read_QA(qa, paragraphs):
-    def is_whitespace(c):
-        if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
-            return True
-        return False
+
+    customTokenizer = tokenization.CustomTokenizer()
 
     examples = []
 
     for paragraph in paragraphs:
-        paragraph_text = paragraph['text']
-        doc_tokens = []
-        char_to_word_offset = []
-        prev_is_whitespace = True
-        for c in paragraph_text:
-            if is_whitespace(c):
-                prev_is_whitespace = True
-            else:
-                if prev_is_whitespace:
-                    doc_tokens.append(c)
-                else:
-                    doc_tokens[-1] += c
-                prev_is_whitespace = False
-            char_to_word_offset.append(len(doc_tokens) - 1)
+        paragraph_text = customTokenizer.clean_text(paragraph['text'])
+        doc_tokens = paragraph_text.split()
 
-        qas_id = paragraph["id"]
+        para_id = paragraph["id"]
         question_text = qa
         start_position = None
         end_position = None
@@ -135,7 +119,7 @@ def read_QA(qa, paragraphs):
         is_impossible = False
 
         example = SquadExample(
-            qas_id=qas_id,
+            qas_id=para_id,
             question_text=question_text,
             doc_tokens=doc_tokens,
             orig_answer_text=orig_answer_text,
@@ -453,7 +437,6 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
     return features
 
 
-
 def get_final_text(pred_text, orig_text, do_lower_case):
   """Project the tokenized prediction back to the original text."""
 
@@ -529,8 +512,7 @@ def get_final_text(pred_text, orig_text, do_lower_case):
       orig_start_position = orig_ns_to_s_map[ns_start_position]
 
   if orig_start_position is None:
-    if FLAGS.verbose_logging:
-      tf.logging.info("Couldn't map start position")
+    tf.logging.info("Couldn't map start position")
     return orig_text
 
   orig_end_position = None
@@ -790,6 +772,8 @@ def process(questions, context):
 
     all_results = []
     counter = 0
+    RawResult = collections.namedtuple("RawResult",
+                                       ["unique_id", "start_logits", "end_logits"])
     for result in estimator.predict(predict_input_fn, yield_single_examples=True):
         unique_id = int(result["unique_ids"])
         start_logits = [float(x) for x in result["start_logits"].flat]
@@ -809,7 +793,7 @@ def process(questions, context):
 
 if __name__ == "__main__":
     tf.logging.set_verbosity(tf.logging.INFO)
-    bertQuestion = 'who is chief operating officer of enercare ?'
+    bertQuestion = 'who is ceo of Altius Minerals ?'
     """
     bertContext = [{"id": 1,
                     "text": '''Upon his retirement, Jenine Krause, Chief Operating Officer, Home Services has been
