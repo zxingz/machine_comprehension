@@ -25,6 +25,24 @@ import six
 import tensorflow as tf
 
 
+class CustomTokenizer(object):
+
+  def __init__(self):
+    pass
+
+  def clean_text(self, text):
+    text = unicodedata.normalize('NFKD', u''+ text).encode('ascii', 'ignore')
+    text = re.compile(r'[\n\r\t]').sub(' ', text)
+    text = text.replace('  ', '')
+    return text
+
+  def tokenize(self, text):
+    text = text.decode("utf-8", "ignore")
+    return text
+
+
+
+
 def validate_case_matches_checkpoint(do_lower_case, init_checkpoint):
   """Checks whether the casing config is consistent with the checkpoint name."""
 
