@@ -27,12 +27,14 @@ from BERT import tokenization
 config = ConfigParser()  # Init config parser
 config.read(os.path.join(appDir, 'config.cfg'))  # Read config file
 modelDir = os.path.realpath(config.get('BERT', 'dest_model_dir'))  # Init model dir
+abbrFile = os.path.realpath(config.get('Static', 'abbr_json'))  # abbr file
 
 if __name__ == '__main__':  # for standalone calls
     modelDir = os.path.join(appDir, 'model')
+    abbrFile =  os.path.realpath('../static/abbreviations.json')  # abbr file
 
 
-class SquadExample(object):
+class Candidates(object):
     """A single training/test example for simple sequence classification.
        For examples without an answer, the start and end position are -1.
     """
@@ -101,24 +103,62 @@ class InputFeatures(object):
         self.is_impossible = is_impossible
 
 
-def read_QA(qa, paragraphs):
+def _check_is_max_context(doc_spans, cur_span_index, position):
+    """Check if this is the 'max context' doc span for the token."""
 
-    customTokenizer = tokenization.CustomTokenizer()
+    # Because of the sliding window approach taken to scoring documents, a single
+    # token can appear in multiple documents. E.g.
+    #  Doc: the man went to the store and bought a gallon of milk
+    #  Span A: the man went to the
+    #  Span B: to the store and bought
+    #  Span C: and bought a gallon of
+    #  ...
+    #
+    # Now the word 'bought' will have two scores from spans B and C. We only
+    # want to consider the score with "maximum context", which we define as
+    # the *minimum* of its left and right context (the *sum* of left and
+    # right context will always be the same, of course).
+    #
+    # In the example the maximum context for 'bought' would be span C since
+    # it has 1 left context and 3 right context, while span B has 4 left context
+    # and 0 right context.
+    best_score = None
+    best_span_index = None
+    for (span_index, doc_span) in enumerate(doc_spans):
+        end = doc_span.start + doc_span.length - 1
+        if position < doc_span.start:
+            continue
+        if position > end:
+            continue
+        num_left_context = position - doc_span.start
+        num_right_context = end - position
+        score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
+        if best_score is None or score > best_score:
+            best_score = score
+            best_span_index = span_index
 
-    examples = []
+    return cur_span_index == best_span_index
 
-    for paragraph in paragraphs:
-        paragraph_text = customTokenizer.clean_text(paragraph['text'])
-        doc_tokens = paragraph_text.split()
 
-        para_id = paragraph["id"]
-        question_text = qa
-        start_position = None
-        end_position = None
-        orig_answer_text = None
-        is_impossible = False
+def read_QA(question, contexts):
 
-        example = SquadExample(
+    customTokenizer = tokenization.CustomTokenizer(abbr_file=abbrFile)
+
+    candidates = []
+
+    question_text = customTokenizer.preprocess(question)
+    start_position = None
+    end_position = None
+    orig_answer_text = None
+    is_impossible = True
+
+    for context in contexts:
+        context_text = customTokenizer.preprocess(context['text'])
+        doc_tokens = context_text.split()
+
+        para_id = context["id"]
+
+        candidate = Candidates(
             qas_id=para_id,
             question_text=question_text,
             doc_tokens=doc_tokens,
@@ -126,8 +166,132 @@ def read_QA(qa, paragraphs):
             start_position=start_position,
             end_position=end_position,
             is_impossible=is_impossible)
-        examples.append(example)
-    return examples
+        candidates.append(candidate)
+    return candidates
+
+
+def convert_candidates_to_features(candidates, tokenizer, max_seq_length,
+                                 doc_stride, max_query_length):
+    """Loads a data file into a list of `InputBatch`s."""
+
+    unique_id = 1000000000
+
+    features = list()
+
+    for (idx, candidate) in enumerate(candidates):
+        query_tokens = tokenizer.tokenize(candidate.question_text)
+        context_tokens = candidate.doc_tokens
+
+        if len(query_tokens) > max_query_length:
+            query_tokens = query_tokens[0:max_query_length]
+
+        tok_to_orig_index = []
+        orig_to_tok_index = []
+        all_doc_tokens = []
+        for (i, token) in enumerate(context_tokens):
+            orig_to_tok_index.append(len(all_doc_tokens))
+            sub_tokens = tokenizer.tokenize(token)
+            for sub_token in sub_tokens:
+                tok_to_orig_index.append(i)
+                all_doc_tokens.append(sub_token)
+
+        # The -3 accounts for [CLS], [SEP] and [SEP]
+        max_tokens_for_doc = max_seq_length - len(query_tokens) - 3
+
+        # We can have documents that are longer than the maximum sequence length.
+        # To deal with this we do a sliding window approach, where we take chunks
+        # of the up to our max length with a stride of `doc_stride`.
+        _DocSpan = collections.namedtuple(  # pylint: disable=invalid-name
+            "DocSpan", ["start", "length"])
+        doc_spans = []
+        start_offset = 0
+        while start_offset < len(all_doc_tokens):
+            length = len(all_doc_tokens) - start_offset
+            if length > max_tokens_for_doc:
+                length = max_tokens_for_doc
+            doc_spans.append(_DocSpan(start=start_offset, length=length))
+            if start_offset + length == len(all_doc_tokens):
+                break
+            start_offset += min(length, doc_stride)
+
+        for (doc_span_index, doc_span) in enumerate(doc_spans):
+            tokens = []
+            token_to_orig_map = {}
+            token_is_max_context = {}
+            segment_ids = []
+            tokens.append("[CLS]")
+            segment_ids.append(0)
+            for token in query_tokens:
+                tokens.append(token)
+                segment_ids.append(0)
+            tokens.append("[SEP]")
+            segment_ids.append(0)
+
+            for i in range(doc_span.length):
+                split_token_index = doc_span.start + i
+                token_to_orig_map[len(tokens)] = tok_to_orig_index[split_token_index]
+
+                is_max_context = _check_is_max_context(doc_spans, doc_span_index,
+                                                       split_token_index)
+                token_is_max_context[len(tokens)] = is_max_context
+                tokens.append(all_doc_tokens[split_token_index])
+                segment_ids.append(1)
+            tokens.append("[SEP]")
+            segment_ids.append(1)
+
+            input_ids = tokenizer.convert_tokens_to_ids(tokens)
+
+            # The mask has 1 for real tokens and 0 for padding tokens. Only real
+            # tokens are attended to.
+            input_mask = [1] * len(input_ids)
+
+            # Zero-pad up to the sequence length.
+            while len(input_ids) < max_seq_length:
+                input_ids.append(0)
+                input_mask.append(0)
+                segment_ids.append(0)
+
+            assert len(input_ids) == max_seq_length
+            assert len(input_mask) == max_seq_length
+            assert len(segment_ids) == max_seq_length
+
+            tf.logging.info("*** Example ***")
+            tf.logging.info("unique_id: %s" % (unique_id))
+            tf.logging.info("example_index: %s" % (idx))
+            tf.logging.info("doc_span_index: %s" % (doc_span_index))
+            tf.logging.info("tokens: %s" % " ".join(
+                [tokenization.printable_text(x) for x in tokens]))
+            tf.logging.info("token_to_orig_map: %s" % " ".join(
+                ["%d:%d" % (x, y) for (x, y) in six.iteritems(token_to_orig_map)]))
+            tf.logging.info("token_is_max_context: %s" % " ".join([
+                "%d:%s" % (x, y) for (x, y) in six.iteritems(token_is_max_context)
+            ]))
+            tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
+            tf.logging.info(
+                "input_mask: %s" % " ".join([str(x) for x in input_mask]))
+            tf.logging.info(
+                "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
+
+            start_position = None
+            end_position = None
+            feature = InputFeatures(
+                unique_id=unique_id,
+                example_index=idx,
+                doc_span_index=doc_span_index,
+                tokens=tokens,
+                token_to_orig_map=token_to_orig_map,
+                token_is_max_context=token_is_max_context,
+                input_ids=input_ids,
+                input_mask=input_mask,
+                segment_ids=segment_ids,
+                start_position=start_position,
+                end_position=end_position,
+                is_impossible=True)
+
+            features.append(feature)
+            unique_id += 1
+
+    return features
 
 
 def input_fn_builder(features, seq_length, drop_remainder):
@@ -275,166 +439,6 @@ def model_fn_builder(bert_config, init_checkpoint, use_one_hot_embeddings):
         return output_spec
 
     return model_fn
-
-
-def _check_is_max_context(doc_spans, cur_span_index, position):
-    """Check if this is the 'max context' doc span for the token."""
-
-    # Because of the sliding window approach taken to scoring documents, a single
-    # token can appear in multiple documents. E.g.
-    #  Doc: the man went to the store and bought a gallon of milk
-    #  Span A: the man went to the
-    #  Span B: to the store and bought
-    #  Span C: and bought a gallon of
-    #  ...
-    #
-    # Now the word 'bought' will have two scores from spans B and C. We only
-    # want to consider the score with "maximum context", which we define as
-    # the *minimum* of its left and right context (the *sum* of left and
-    # right context will always be the same, of course).
-    #
-    # In the example the maximum context for 'bought' would be span C since
-    # it has 1 left context and 3 right context, while span B has 4 left context
-    # and 0 right context.
-    best_score = None
-    best_span_index = None
-    for (span_index, doc_span) in enumerate(doc_spans):
-        end = doc_span.start + doc_span.length - 1
-        if position < doc_span.start:
-            continue
-        if position > end:
-            continue
-        num_left_context = position - doc_span.start
-        num_right_context = end - position
-        score = min(num_left_context, num_right_context) + 0.01 * doc_span.length
-        if best_score is None or score > best_score:
-            best_score = score
-            best_span_index = span_index
-
-    return cur_span_index == best_span_index
-
-
-def convert_examples_to_features(examples, tokenizer, max_seq_length,
-                                 doc_stride, max_query_length):
-    """Loads a data file into a list of `InputBatch`s."""
-
-    unique_id = 1000000000
-
-    features = []
-
-    for (example_index, example) in enumerate(examples):
-        query_tokens = tokenizer.tokenize(example.question_text)
-
-        if len(query_tokens) > max_query_length:
-            query_tokens = query_tokens[0:max_query_length]
-
-        tok_to_orig_index = []
-        orig_to_tok_index = []
-        all_doc_tokens = []
-        for (i, token) in enumerate(example.doc_tokens):
-            orig_to_tok_index.append(len(all_doc_tokens))
-            sub_tokens = tokenizer.tokenize(token)
-            for sub_token in sub_tokens:
-                tok_to_orig_index.append(i)
-                all_doc_tokens.append(sub_token)
-
-        # The -3 accounts for [CLS], [SEP] and [SEP]
-        max_tokens_for_doc = max_seq_length - len(query_tokens) - 3
-
-        # We can have documents that are longer than the maximum sequence length.
-        # To deal with this we do a sliding window approach, where we take chunks
-        # of the up to our max length with a stride of `doc_stride`.
-        _DocSpan = collections.namedtuple(  # pylint: disable=invalid-name
-            "DocSpan", ["start", "length"])
-        doc_spans = []
-        start_offset = 0
-        while start_offset < len(all_doc_tokens):
-            length = len(all_doc_tokens) - start_offset
-            if length > max_tokens_for_doc:
-                length = max_tokens_for_doc
-            doc_spans.append(_DocSpan(start=start_offset, length=length))
-            if start_offset + length == len(all_doc_tokens):
-                break
-            start_offset += min(length, doc_stride)
-
-        for (doc_span_index, doc_span) in enumerate(doc_spans):
-            tokens = []
-            token_to_orig_map = {}
-            token_is_max_context = {}
-            segment_ids = []
-            tokens.append("[CLS]")
-            segment_ids.append(0)
-            for token in query_tokens:
-                tokens.append(token)
-                segment_ids.append(0)
-            tokens.append("[SEP]")
-            segment_ids.append(0)
-
-            for i in range(doc_span.length):
-                split_token_index = doc_span.start + i
-                token_to_orig_map[len(tokens)] = tok_to_orig_index[split_token_index]
-
-                is_max_context = _check_is_max_context(doc_spans, doc_span_index,
-                                                       split_token_index)
-                token_is_max_context[len(tokens)] = is_max_context
-                tokens.append(all_doc_tokens[split_token_index])
-                segment_ids.append(1)
-            tokens.append("[SEP]")
-            segment_ids.append(1)
-
-            input_ids = tokenizer.convert_tokens_to_ids(tokens)
-
-            # The mask has 1 for real tokens and 0 for padding tokens. Only real
-            # tokens are attended to.
-            input_mask = [1] * len(input_ids)
-
-            # Zero-pad up to the sequence length.
-            while len(input_ids) < max_seq_length:
-                input_ids.append(0)
-                input_mask.append(0)
-                segment_ids.append(0)
-
-            assert len(input_ids) == max_seq_length
-            assert len(input_mask) == max_seq_length
-            assert len(segment_ids) == max_seq_length
-
-            tf.logging.info("*** Example ***")
-            tf.logging.info("unique_id: %s" % (unique_id))
-            tf.logging.info("example_index: %s" % (example_index))
-            tf.logging.info("doc_span_index: %s" % (doc_span_index))
-            tf.logging.info("tokens: %s" % " ".join(
-                [tokenization.printable_text(x) for x in tokens]))
-            tf.logging.info("token_to_orig_map: %s" % " ".join(
-                ["%d:%d" % (x, y) for (x, y) in six.iteritems(token_to_orig_map)]))
-            tf.logging.info("token_is_max_context: %s" % " ".join([
-                "%d:%s" % (x, y) for (x, y) in six.iteritems(token_is_max_context)
-            ]))
-            tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-            tf.logging.info(
-                "input_mask: %s" % " ".join([str(x) for x in input_mask]))
-            tf.logging.info(
-                "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-
-            start_position = None
-            end_position = None
-            feature = InputFeatures(
-                unique_id=unique_id,
-                example_index=example_index,
-                doc_span_index=doc_span_index,
-                tokens=tokens,
-                token_to_orig_map=token_to_orig_map,
-                token_is_max_context=token_is_max_context,
-                input_ids=input_ids,
-                input_mask=input_mask,
-                segment_ids=segment_ids,
-                start_position=start_position,
-                end_position=end_position,
-                is_impossible=example.is_impossible)
-
-            features.append(feature)
-            unique_id += 1
-
-    return features
 
 
 def get_final_text(pred_text, orig_text, do_lower_case):
@@ -742,16 +746,16 @@ def write_QA(all_examples, all_features, all_results, n_best_size,
     return all_nbest_json
 
 
-def process(questions, context):
+def process(question, contexts):
     # TODO Replace all abbreviation code
 
     bert_config = modeling.BertConfig.from_json_file(os.path.join(modelDir, 'bert_config.json'))  # Loading bert config
     tokenizer = tokenization.FullTokenizer(vocab_file=os.path.join(modelDir, 'vocab.txt'),
-                                           do_lower_case=True)  # Loading tokenizer
+                                           do_lower_case=False)  # Loading tokenizer
 
-    eval_examples = read_QA(questions, context)
-    eval_features = convert_examples_to_features(
-        examples=eval_examples,
+    candidates = read_QA(question, contexts)
+    eval_features = convert_candidates_to_features(
+        candidates=candidates,
         tokenizer=tokenizer,
         max_seq_length=512,
         doc_stride=256,
@@ -786,22 +790,13 @@ def process(questions, context):
         counter += 1
         if len(eval_features) == counter: break
 
-    all_nbest_json = write_QA(eval_examples, eval_features, all_results,
+    all_nbest_json = write_QA(candidates, eval_features, all_results,
                                                           2, 128, False)
     return all_nbest_json
 
 
 if __name__ == "__main__":
     tf.logging.set_verbosity(tf.logging.INFO)
-    bertQuestion = 'who is ceo of Altius Minerals ?'
-    """
-    bertContext = [{"id": 1,
-                    "text": '''Upon his retirement, Jenine Krause, Chief Operating Officer, Home Services has been
-appointed President and Chief Executive Officer of Enercare.'''},
-                   {"id": 2,
-                    "text": '''Upon his retirement, Jenine Krause, Chief Operating Officer, Home Services has been
-    appointed President and Chief Executive Officer of Enercare.'''},
-                   ]
-    """
-    bertContext = [{'text': u'Date: Ticker Symbol: 07-Feb-2019   ALS.TSX   Civic Address: Altius Minerals Corporation Suite 202, 66 Kenmount Road St. Johns, NL, A1B 3V7, CANADA Website: www.altiusminerals.com Fax: 709.576.3441 e-mail: info@altiusminerals.com Mailing Address: Altius Minerals Corporation P.O. Box 8263 Stn A St. Johns, NL, A1B 3N4, CANADA Maritime Electric, Newfoundland Power and Fortis Alberta and then CEO roles at subsidiaries Fortis Properties and Newfoundland Power. Brian Dalton, President and CEO of Altius, commented, Altius has now taken the creation of a royalty business based around long-life renewable energy strong execution and strategic growth, said John Billingsley, Chairman and CEO of Tri Global Energy. 2018 also was one of our best years for completing and initiating renewable energy development projects. This transaction with Altius will accelerate our development and allow us to extend our involvement in these projects financing products like the renewable royalty investment provided by Altius. More information on the transaction and ARR, including an investor presentation, can be found at http://www.altiusminerals.com/. About Altius Altius directly and indirectly holds diversified royalties and streams which generate royalties covering a wide spectrum of mineral commodities and jurisdictions. Altius also holds a large portfolio of exploration stage projects which it has generated that results in newly created royalties and equity and minority interests. Altius has 42,851,726 common shares issued and outstanding that are listed on Canadas Toronto', 'id': 0}, {'text': u'Date: Ticker Symbol: 07-Feb-2019   ALS.TSX   Civic Address: Altius Minerals Corporation Suite 202, 66 Kenmount Road St. Johns, NL, A1B 3V7, CANADA Website: www.altiusminerals.com Fax: 709.576.3441 e-mail: info@altiusminerals.com Mailing Address: Altius Minerals Corporation P.O. Box 8263 Stn A St. Johns, NL, A1B 3N4, CANADA   Altius Announces First Renewable Energy Royalty Transaction - US$30MM transaction with leading U.S. wind energy developer - St. Johns - Altius Minerals Corporation (Altius) (ALS:TSX, ATUSF: OTCQX) is pleased to announce that its recently formed subsidiary, Altius Renewable Royalties Corp. (ARR), has entered into a transaction with Tri Global Energy projects added in the future, to this new royalty investment structure with Altius, until a minimum total royalty portfolio valuation threshold is achieved. The currently power price changes. Funding for the TGE transaction will be provided from Altius available cash on hand. Depending upon the scale of the overall opportunity set that develops for ARR, Altius may also consider adding additional future investment partners as either direct participants or through the creation of limited partnership structures. Altius Renewable Royalties As part of its founding, ARR has acquired a private company, Great and elsewhere. This management team, led by Frank Getman (President and CEO), has a long and successful track record of developing and operating small and large-scale the Board of Directors, joining Mr. Getman and parent level appointees of Altius Minerals Corporation that include its CEO and CFO. Earl retired at the end of 2017 from Fortis Inc. which is a major international electrical', 'id': 1}, {'text': u'Voiseys Bay The royalty on production of nickel, copper, cobalt and other minerals from the Voiseys Bay mine in Newfoundland and Labrador, Canada is directly owned 90% owner. The remaining 10% interest in LNRLP is owned by a subsidiary of Altius Minerals Corporation (Altius), a non-controlling interest. On September 13, 2018, LNRLP entered into an agreement with', 'id': 2}, {'text': u'Voiseys Bay The royalty on production of nickel, copper, cobalt and other minerals from the Voiseys Bay mine in Newfoundland and Labrador, Canada is directly owned 90% owner. The remaining 10% interest in LNRLP is owned by a subsidiary of Altius Minerals Corporation (Altius), a non-controlling interest. On September 13, 2018, LNRLP entered into an agreement with', 'id': 3}, {'text': u'Voiseys Bay The royalty on production of nickel, copper, cobalt and other minerals from the Voiseys Bay mine in Newfoundland and Labrador, Canada is directly owned 90% owner. The remaining 10% interest in LNRLP is owned by a subsidiary of Altius Minerals Corporation (Altius). On September 13, 2018, LNRLP entered into an agreement with Vale Canada Limited and certain', 'id': 4}]
-    print(process(questions=bertQuestion, context=bertContext))
+    bertQuestion = 'who is ceo of cibc ?'
+    bertContext = [{'text': u'4CIBC External A Message from the CEO November 2018 For more than 150 years, weve been helping families prosper and businesses grow. Our team has earned a reputation for excellence and has built a culture based on our shared values of trust, teamwork, and accountability. At the heart. Of our reputation is our team of 45,000 members who proudly put our clients at the centre of everything we do. As we transform CIBC into a relationship-oriented bank for a modern world, its incumbent upon every one of us to uphold the highest standards of ethical and professional behaviour. The CIBC Code of Conduct (the Code) is more than words on a page. It sets out the principles. Our reputation and our culture are the foundation of our success as we build the bank of the future a place where we give our very best to each other and where our clients receive the very best from all of us. Sincerely, Victor Dodig President and CEO. CIBC 2018 Annual Information Form 9 DIRECTORS AND OFFICERS Directors and Board Committees Information concerning the directors and board committees of CIBC is found on page 194 of the 2018 Annual Report. All of the directors have held their. Officers, their titles and their municipalities of residence, as at November 28, 2018: Name Title                              Municipality of Residence Victor G. Dodig        President and Chief Executive Officer, CIBC               Toronto, Ontario, Canada Michael G. Capatides      Senior Executive Vice-President, Chief Administrative Officer and General Counsel Morristown, New Jersey, U.S. Harry Culham        Senior Executive Vice-President and Group Head, Capital Markets       Toronto. Canada Kevin Patterson        Senior Executive Vice-President and Group Head, Technology and Operations  Niagara-on-the-Lake, Ontario, Canada Larry D. Richman       Senior Executive Vice-President and Group Head, US Region; President and CEO, CIBC Bank USA Chicago, Illinois, U.S. Sandy Sharman        Senior Executive Vice-President and Chief Human Resources and Communications Officer Burlington, Ontario, Canada All of the executive officers have held their present position or another. Executive position in CIBC for more than five years except for Deepak Khandelwal who was at Rogers Communications Inc. from 2014 to 2017 where he was Chief Customer Officer and prior to that was at Google Inc. from 2010 to 2014 where he held a series of senior positions. And was last VP, Global Customer Experience; and Larry D. Richman who was at The PrivateBank from 2007 to 2017, where he was President and CEO. Shareholdings of Directors and Executive Officers To CIBCs knowledge, as at October 31, 2018, the directors and executive officers of CIBC as a group, beneficially owned, directly or indirectly, or exercised control or direction over less than. 1% of the outstanding common shares of CIBC or FirstCaribbean International Bank Limited. CIBC 2018 Annual Information Form 9 DIRECTORS AND OFFICERS Directors and Board Committees Information concerning the directors and board committees of CIBC is found on page 194 of the 2018 Annual Report. All of the directors have held their. Officers, their titles and their municipalities of residence, as at November 28, 2018: Name Title                              Municipality of Residence Victor G. Dodig        President and Chief Executive Officer, CIBC               Toronto, Ontario, Canada Michael G. Capatides      Senior Executive Vice-President, Chief Administrative Officer and General Counsel Morristown, New Jersey, U.S. Harry Culham        Senior Executive Vice-President and Group Head, Capital Markets       Toronto. Canada Kevin Patterson        Senior Executive Vice-President and Group Head, Technology and Operations  Niagara-on-the-Lake, Ontario, Canada Larry D. Richman       Senior Executive Vice-President and Group Head, US Region; President and CEO, CIBC Bank USA Chicago, Illinois, U.S. Sandy Sharman        Senior Executive Vice-President and Chief Human Resources and Communications Officer Burlington, Ontario, Canada All of the executive officers have held their present position or another. Executive position in CIBC for more than five years except for Deepak Khandelwal who was at Rogers Communications Inc. from 2014 to 2017 where he was Chief Customer Officer and prior to that was at Google Inc. from 2010 to 2014 where he held a series of senior positions. And was last VP, Global Customer Experience; and Larry D. Richman who was at The PrivateBank from 2007 to 2017, where he was President and CEO. Shareholdings of Directors and Executive Officers To CIBCs knowledge, as at October 31, 2018, the directors and executive officers of CIBC as a group, beneficially owned, directly or indirectly, or exercised control or direction over less than. 1% of the outstanding common shares of CIBC or FirstCaribbean International Bank Limited', 'id': '2s1'}]
+    print(process(question=bertQuestion, contexts=bertContext))
